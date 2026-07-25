@@ -290,16 +290,6 @@ a:hover { text-decoration: underline; }
   margin-bottom: 0;
 }
 
-.table-click-hint {
-  font-size: 0.78rem;
-  color: #2563eb;
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-weight: 600;
-}
-
 .result-count {
   font-size: 0.82rem;
   color: var(--gray-600);
