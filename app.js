@@ -838,43 +838,9 @@ function initCompositeRatings() {
     p.advanced.passBlockWinRate = p.advanced.passBlockWinRate || parseFloat((84 + (baseRating - 70) * 0.5).toFixed(1));
     p.advanced.snaps = p.advanced.snaps || Math.round(280 + baseRating * 4.5);
 
-    // Value Score: Ratio between EPA/WAR/PFF efficiency and composite recruiting rank
-    const epaVal = p.advanced.epaPerPlay ?? 0.2;
-    const warVal = p.advanced.war ?? 0.5;
-    const gradeVal = p.advanced.overallGrade ?? 75;
-    const comp = p.compositeRating || 80;
-
-    const efficiencyIndex = (warVal * 2.2) + (epaVal * 3.5) + ((gradeVal - 65) / 10);
-    const expectedIndex = Math.max(0.6, (comp - 65) / 12);
-
-    const rawRatio = efficiencyIndex / expectedIndex;
-    let valScore = Math.round((rawRatio * 2.1 + 5.2) * 10) / 10;
-    if (isNaN(valScore)) valScore = 8.0;
-    p.valueScore = Math.min(9.9, Math.max(6.2, valScore));
   });
 }
 
-function valueScoreBadge(score) {
-  if (score === null || score === undefined) return '<td class="td-null">N/A</td>';
-  
-  let badgeClass = 'value-std';
-  let tag = 'Solid Value';
-
-  if (score >= 9.0) {
-    badgeClass = 'value-gem';
-    tag = '🔥 Elite Gem';
-  } else if (score >= 8.2) {
-    badgeClass = 'value-high';
-    tag = '⭐ High Value';
-  }
-
-  return `<td title="Value Score: Advanced EPA/WAR efficiency ratio relative to recruiting rank">
-    <div class="value-score-badge ${badgeClass}">
-      <span class="value-num">${score.toFixed(1)}</span>
-      <span class="value-tag">${tag}</span>
-    </div>
-  </td>`;
-}
 
 // ── Dynamic Header Label Resolver ──────────────────────────────
 function getHeaderLabel(colKey, posFilter) {
@@ -925,7 +891,6 @@ const cols = {
     { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
     { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
     { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
-    { key: 'valueScore',      label: 'Value Score',  render: p => valueScoreBadge(p.valueScore) },
     { key: 'height',          label: 'Ht/Wt',        render: p => `<span class="td-school">${p.height} / ${p.weight}</span>` },
     { key: 'stat1',           label: '',             render: p => tradStat1(p) },
     { key: 'stat2',           label: '',             render: p => tradStat2(p) },
@@ -937,7 +902,6 @@ const cols = {
     { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
     { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
     { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
-    { key: 'valueScore',      label: 'Value Score',  render: p => valueScoreBadge(p.valueScore) },
     { key: 'overallGrade',    label: 'Overall Grade',render: p => gradeBadge(p.advanced.overallGrade) },
     { key: 'adv1',            label: '',             render: p => advStat1(p) },
     { key: 'adv2',            label: '',             render: p => advStat2(p) },
@@ -950,7 +914,6 @@ const cols = {
     { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
     { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
     { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
-    { key: 'valueScore',      label: 'Value Score',  render: p => valueScoreBadge(p.valueScore) },
     { key: 'height',          label: 'Ht/Wt',        render: p => `<span class="td-school">${p.height} / ${p.weight}</span>` },
     { key: 'stat1',           label: '',             render: p => tradStat1(p) },
     { key: 'stat2',           label: '',             render: p => tradStat2(p) },
@@ -1180,7 +1143,6 @@ function getSortValue(player, key) {
   if (key === 'pos')             return player.pos;
   if (key === 'prevSchool')      return player.prevSchool.toLowerCase();
   if (key === 'compositeRating' || key === 'on3Rating') return player.compositeRating || player.on3Rating || 0;
-  if (key === 'valueScore')      return player.valueScore || 0;
   if (key === 'overallGrade')    return player.advanced?.overallGrade || 0;
   if (key === 'adv1') return getAdvNum(player, 1);
   if (key === 'adv2') return getAdvNum(player, 2);
@@ -1313,10 +1275,6 @@ function openPlayerModal(p) {
   const successPct = Math.min(99, Math.max(35, Math.round((parseFloat(success) / 60) * 100)));
   const impactPct = Math.min(99, Math.max(45, Math.round(((parseFloat(war) || 0.6) / 1.5) * 100)));
   
-  const valScore = p.valueScore ? p.valueScore.toFixed(1) : '8.0';
-  const valTag = p.valueScore >= 9.0 ? '🔥 Elite Gem' : p.valueScore >= 8.2 ? '⭐ High Value' : 'Solid Value';
-  const valPct = Math.min(99, Math.max(35, Math.round(((parseFloat(valScore) - 6.0) / 3.9) * 100)));
-
   const bodyHtml = `
     <div class="player-overview-banner">
       <div class="player-bio-group">
@@ -1324,7 +1282,6 @@ function openPlayerModal(p) {
         <span class="player-bio-sub">Previous Program: <strong>${p.prevSchool}</strong> · 2026 Arkansas Commit</span>
       </div>
       <div class="player-ratings-strip">
-        <span class="rating-chip highlight-value" style="background:${p.valueScore >= 9.0 ? '#dc2626' : '#2563eb'};color:#fff;font-weight:800;">Value Score: ${valScore} (${valTag})</span>
         <span class="rating-chip highlight">Composite: ${p.compositeRating ? p.compositeRating.toFixed(1) : 'N/A'}</span>
         <span class="rating-chip">On3: ${p.ratings?.on3 ?? '—'}</span>
         <span class="rating-chip">247: ${p.ratings?.twentyFourSeven ?? '—'}</span>
@@ -1365,10 +1322,6 @@ function openPlayerModal(p) {
 
     <div class="analytics-section-title">📈 National Percentile Rankings</div>
     <div class="percentile-container">
-      <div class="percentile-row">
-        <div class="percentile-meta"><span>Transfer Value Index (Efficiency vs Recruiting Rank)</span><span>${valPct}th Percentile</span></div>
-        <div class="percentile-track"><div class="percentile-fill ${valPct > 80 ? 'elite' : ''}" style="width:${valPct}%"></div></div>
-      </div>
       <div class="percentile-row">
         <div class="percentile-meta"><span>Composite Talent Profile</span><span>${compPct}th Percentile</span></div>
         <div class="percentile-track"><div class="percentile-fill ${compPct > 80 ? 'elite' : ''}" style="width:${compPct}%"></div></div>
@@ -1633,11 +1586,6 @@ function updateSummaryCards() {
   const totalWarVal = players.reduce((sum, p) => sum + (p.advanced?.war || 0.45), 0);
   const totalWarEl = document.getElementById('totalWAR');
   if (totalWarEl) totalWarEl.textContent = `${totalWarVal.toFixed(1)}`;
-
-  // Value Gems Count
-  const gemsCount = players.filter(p => p.valueScore >= 9.0).length;
-  const gemsEl = document.getElementById('topGemsCount');
-  if (gemsEl) gemsEl.textContent = gemsCount;
 
   const power4 = ['Alabama','Auburn','Arkansas','Georgia','LSU','Mississippi State',
     'Ole Miss','Missouri','Tennessee','Texas A&M','Vanderbilt','Kentucky','Florida',

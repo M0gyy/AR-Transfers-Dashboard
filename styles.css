@@ -290,16 +290,6 @@ a:hover { text-decoration: underline; }
   margin-bottom: 0;
 }
 
-.table-click-hint {
-  font-size: 0.78rem;
-  color: #2563eb;
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-weight: 600;
-}
-
 .result-count {
   font-size: 0.82rem;
   color: var(--gray-600);
@@ -471,69 +461,6 @@ tbody td {
   border: 1px solid #e5e7eb;
 }
 
-/* ── Value Score Badge ─────────────────────────────────────── */
-.value-score-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-weight: 800;
-  font-size: 0.8rem;
-  line-height: 1.2;
-  white-space: nowrap;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-
-.value-score-badge:hover {
-  transform: translateY(-1px);
-}
-
-.value-score-badge.value-gem {
-  background: linear-gradient(135deg, #fef3c7 0%, #fee2e2 100%);
-  color: #991b1b;
-  border: 1px solid #fca5a5;
-  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.18);
-}
-
-.value-score-badge.value-high {
-  background: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
-}
-
-.value-score-badge.value-std {
-  background: #f3f4f6;
-  color: #374151;
-  border: 1px solid #e5e7eb;
-}
-
-.value-num {
-  font-size: 0.86rem;
-  font-weight: 900;
-  letter-spacing: -0.3px;
-}
-
-.value-tag {
-  font-size: 0.68rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: rgba(255,255,255,0.7);
-}
-
-.value-gem .value-tag {
-  background: #ef4444;
-  color: #ffffff;
-}
-
-.value-high .value-tag {
-  background: #2563eb;
-  color: #ffffff;
-}
 
 .rating-na    { color: var(--gray-400); font-style: italic; }
 
