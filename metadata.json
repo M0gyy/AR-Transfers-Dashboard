@@ -1,0 +1,8 @@
+{
+  "name": "Arkansas Razorbacks 2026 Transfer Dashboard",
+  "description": "Interactive transfer portal dashboard for Arkansas Razorbacks football 2026 transfers, stats, charts, and player comparisons.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

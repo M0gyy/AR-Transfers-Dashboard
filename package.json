@@ -1,0 +1,11 @@
+{
+  "name": "arkansas-2026-transfers",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "build": "echo 'No build step required'",
+    "start": "node server.js"
+  }
+}
