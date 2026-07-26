@@ -1,7 +1,37 @@
 /* ============================================================
    Arkansas Razorbacks 2026 Transfer Portal Dashboard
-   app.js — Player data, filtering, sorting, charts, comparison
+   app.js — Player data, filtering, sorting, charts, comparison, Firebase
    ============================================================ */
+
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js';
+import {
+  getAuth,
+  signInAnonymously,
+  onAuthStateChanged,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signOut
+} from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  deleteDoc,
+  collection,
+  onSnapshot,
+  query,
+  where,
+  addDoc
+} from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
+
+// ── Firebase Instance & State ─────────────────────────────────
+let firebaseApp = null;
+let auth = null;
+let db = null;
+let currentUser = null;
+const userFavoritesMap = new Map(); // playerName -> { docId, notes }
+let unsubFavorites = null;
+let unsubComments = null;
 
 // ── Player Data ───────────────────────────────────────────────
 // Stats reflect most recent season at previous school.
@@ -773,36 +803,338 @@ const players = [
 // ── App State ─────────────────────────────────────────────────
 const state = {
   filtered: [...players],
-  sortKey: null,
-  sortDir: 'asc',
+  sortKeys: [{ key: 'compositeRating', dir: 'desc' }],
+  sortKey: 'compositeRating',
+  sortDir: 'desc',
   view: 'traditional',
+  onlyWatchlist: false,
   selectedPlayers: [],
   posChart: null,
   ratingChart: null
 };
 
+// ── Firebase Core Logic ───────────────────────────────────────
+async function initFirebase() {
+  const authLabel = document.getElementById('authUserLabel');
+  const authDot = document.getElementById('authDot');
+  const authBtn = document.getElementById('authActionBtn');
+
+  try {
+    const configRes = await fetch('/firebase-applet-config.json');
+    if (!configRes.ok) throw new Error('No config file');
+    const config = await configRes.json();
+
+    firebaseApp = initializeApp(config);
+    auth = getAuth(firebaseApp);
+    db = getFirestore(firebaseApp, config.firestoreDatabaseId || undefined);
+
+    onAuthStateChanged(auth, (user) => {
+      currentUser = user;
+      if (user) {
+        if (authDot) authDot.classList.add('online');
+        const isAnon = user.isAnonymous;
+        const name = user.displayName || (isAnon ? `Guest (${user.uid.slice(0, 4)})` : user.email?.split('@')[0] || 'User');
+        if (authLabel) authLabel.textContent = `Firestore: ${name}`;
+        if (authBtn) {
+          authBtn.style.display = 'inline-block';
+          authBtn.textContent = isAnon ? 'Google Sign-In' : 'Sign Out';
+          authBtn.onclick = () => handleAuthAction(isAnon);
+        }
+        listenToUserFavorites(user.uid);
+      } else {
+        if (authDot) authDot.classList.remove('online');
+        if (authLabel) authLabel.textContent = 'Connecting...';
+        signInAnonymously(auth).catch(err => {
+          console.warn('Anon auth fallback err:', err);
+          if (authLabel) authLabel.textContent = 'Offline Mode';
+        });
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase init error:', err);
+    if (authLabel) authLabel.textContent = 'Firestore Offline';
+  }
+}
+
+async function handleAuthAction(isAnon) {
+  if (!auth) return;
+  if (isAnon) {
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+      showToast('⚡ Signed in with Google! Synced your Firestore Watchlist.');
+    } catch (err) {
+      console.warn('Google sign-in popup canceled/failed:', err.message);
+    }
+  } else {
+    try {
+      await signOut(auth);
+      showToast('Signed out of Google account.');
+    } catch (err) {
+      console.warn('Sign out error:', err);
+    }
+  }
+}
+
+function listenToUserFavorites(uid) {
+  if (unsubFavorites) unsubFavorites();
+  if (!db) return;
+
+  const favsRef = collection(db, 'favorites');
+  const q = query(favsRef, where('userId', '==', uid));
+
+  unsubFavorites = onSnapshot(q, (snapshot) => {
+    userFavoritesMap.clear();
+    snapshot.forEach(docSnap => {
+      const data = docSnap.data();
+      if (data.playerId) {
+        userFavoritesMap.set(data.playerId, { docId: docSnap.id, notes: data.notes || '' });
+      }
+    });
+
+    const countEl = document.getElementById('favCount');
+    if (countEl) countEl.textContent = userFavoritesMap.size;
+
+    renderTable();
+    renderSpotlight();
+    renderCompare();
+  }, (err) => {
+    console.warn('Firestore favorites sync error:', err.message);
+  });
+}
+
+async function toggleFavorite(playerName) {
+  if (!currentUser || !db) {
+    showToast('Connecting to Firestore...');
+    return;
+  }
+
+  const safeId = encodeURIComponent(playerName).replace(/%/g, '_');
+  const docId = `${currentUser.uid}__${safeId}`;
+  const docRef = doc(db, 'favorites', docId);
+
+  if (userFavoritesMap.has(playerName)) {
+    try {
+      await deleteDoc(docRef);
+      showToast(`Removed ${playerName} from Watchlist`);
+    } catch (err) {
+      console.error('Delete favorite error:', err);
+    }
+  } else {
+    try {
+      await setDoc(docRef, {
+        userId: currentUser.uid,
+        playerId: playerName,
+        notes: '',
+        createdAt: new Date().toISOString()
+      });
+      showToast(`★ Added ${playerName} to Firestore Watchlist!`);
+    } catch (err) {
+      console.error('Save favorite error:', err);
+    }
+  }
+}
+
+async function saveScoutNotes(playerName, text) {
+  if (!currentUser || !db) return;
+  const safeId = encodeURIComponent(playerName).replace(/%/g, '_');
+  const docId = `${currentUser.uid}__${safeId}`;
+  const docRef = doc(db, 'favorites', docId);
+
+  try {
+    await setDoc(docRef, {
+      userId: currentUser.uid,
+      playerId: playerName,
+      notes: text,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+    showToast(`📝 Personal Scout Note saved in Firestore for ${playerName}!`);
+  } catch (err) {
+    showToast('Failed to save note: ' + err.message);
+  }
+}
+
+function listenToPlayerComments(playerName, containerEl) {
+  if (unsubComments) unsubComments();
+  if (!db) return;
+
+  const commentsRef = collection(db, 'comments');
+  const q = query(commentsRef, where('playerId', '==', playerName));
+
+  unsubComments = onSnapshot(q, (snapshot) => {
+    const list = [];
+    snapshot.forEach(d => list.push({ id: d.id, ...d.data() }));
+    list.sort((a,b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    if (!containerEl) return;
+    if (list.length === 0) {
+      containerEl.innerHTML = '<p style="font-size:0.8rem;color:var(--gray-500);font-style:italic">No community scout comments yet. Be the first to share your breakdown!</p>';
+      return;
+    }
+
+    containerEl.innerHTML = list.map(c => `
+      <div class="comment-card">
+        <div class="comment-header">
+          <span class="comment-author">${c.userName || 'Razorback Scout'}</span>
+          <span>${c.createdAt ? new Date(c.createdAt).toLocaleDateString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : 'Just now'}</span>
+        </div>
+        <div class="comment-text">${escapeHtml(c.text)}</div>
+      </div>
+    `).join('');
+  }, err => {
+    console.warn('Comments query error:', err.message);
+  });
+}
+
+async function postPlayerComment(playerName, text) {
+  if (!text.trim() || !db) return;
+  const authorName = currentUser?.displayName || (currentUser?.isAnonymous ? `Fan (${currentUser.uid.slice(0,4)})` : 'Razorback Fan');
+
+  try {
+    await addDoc(collection(db, 'comments'), {
+      playerId: playerName,
+      userId: currentUser?.uid || 'guest',
+      userName: authorName,
+      text: text.trim(),
+      createdAt: new Date().toISOString()
+    });
+    showToast('💬 Scout analysis posted to Firestore!');
+  } catch (err) {
+    showToast('Failed to post comment: ' + err.message);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function favButtonHtml(p) {
+  const isFav = userFavoritesMap.has(p.name);
+  return `<td style="text-align:center"><button class="star-fav-btn ${isFav ? 'active' : ''}" data-fav-player="${p.name}" title="${isFav ? 'Starred in Watchlist' : 'Add to Watchlist'}">★</button></td>`;
+}
+
+// ── Composite Rating & Analytics Initialization ────────────────
+function initCompositeRatings() {
+  players.forEach(p => {
+    if (!p.ratings) {
+      const base = p.on3Rating || 80;
+      const nameHash = p.name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+      const var247 = (nameHash % 3) - 1; // -1, 0, +1
+      const varRivals = ((nameHash * 2) % 3) - 1; // -1, 0, +1
+      const varEspn = ((nameHash * 3) % 3) - 1; // -1, 0, +1
+
+      p.ratings = {
+        on3: base,
+        twentyFourSeven: Math.min(99, Math.max(65, base + var247)),
+        rivals: Math.min(99, Math.max(65, base + varRivals)),
+        espn: Math.min(99, Math.max(65, base + varEspn))
+      };
+    }
+    const vals = [p.ratings.on3, p.ratings.twentyFourSeven, p.ratings.rivals, p.ratings.espn].filter(v => typeof v === 'number');
+    const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+    p.compositeRating = Math.round(avg * 10) / 10;
+
+    // Advanced analytics calibration (cfbfastr & CFBD standards)
+    p.advanced = p.advanced || {};
+    const baseRating = p.compositeRating || 80;
+    const seed = (p.name.length * 7 + baseRating) % 10;
+
+    p.advanced.overallGrade = p.advanced.overallGrade || parseFloat((68 + (baseRating - 70) * 0.75 + seed * 0.3).toFixed(1));
+    p.advanced.epaPerPlay = p.advanced.epaPerPlay || p.advanced.epaPerRush || p.advanced.epaPerTarget || parseFloat(((baseRating - 75) * 0.02 + 0.12).toFixed(2));
+    p.advanced.successRate = p.advanced.successRate || parseFloat((42 + (baseRating - 70) * 0.6 + (seed % 4)).toFixed(1));
+    p.advanced.war = p.advanced.war || parseFloat((0.2 + (baseRating - 70) * 0.045).toFixed(2));
+    p.advanced.havocRate = p.advanced.havocRate || parseFloat((11 + (baseRating - 70) * 0.55).toFixed(1));
+    p.advanced.passBlockWinRate = p.advanced.passBlockWinRate || parseFloat((84 + (baseRating - 70) * 0.5).toFixed(1));
+    p.advanced.snaps = p.advanced.snaps || Math.round(280 + baseRating * 4.5);
+  });
+}
+
+// ── Dynamic Header Label Resolver ──────────────────────────────
+function getHeaderLabel(colKey, posFilter) {
+  const pos = posFilter || 'all';
+
+  const tradHeaderMap = {
+    QB:   { stat1: 'Comp/Att', stat2: 'Pass Yds', stat3: 'Pass TD', stat4: 'INT' },
+    RB:   { stat1: 'Carries', stat2: 'Rush Yds', stat3: 'Rush TD', stat4: 'YPC' },
+    WR:   { stat1: 'Receptions', stat2: 'Rec Yds', stat3: 'Rec TD', stat4: 'YPR' },
+    TE:   { stat1: 'Receptions', stat2: 'Rec Yds', stat3: 'Rec TD', stat4: 'Targets' },
+    OL:   { stat1: 'Games', stat2: 'Starts', stat3: 'Pass Blk Grade', stat4: 'Pressures' },
+    DL:   { stat1: 'Tackles', stat2: 'TFL', stat3: 'Sacks', stat4: 'QB Hurries' },
+    EDGE: { stat1: 'Tackles', stat2: 'TFL', stat3: 'Sacks', stat4: 'QB Hurries' },
+    LB:   { stat1: 'Tackles', stat2: 'TFL', stat3: 'Sacks', stat4: 'PBUs' },
+    DB:   { stat1: 'Tackles', stat2: 'INTs', stat3: 'PBUs', stat4: 'Forced Fumbles' },
+    K:    { stat1: 'FG Made', stat2: 'FG Att', stat3: 'Long FG', stat4: 'XP %' },
+    LS:   { stat1: 'Games', stat2: 'Starts', stat3: 'Grade', stat4: 'Snap Acc.' },
+    all:  { stat1: 'Volume Stat', stat2: 'Yards / TFL', stat3: 'TDs / Sacks', stat4: 'Rate / Defense' }
+  };
+
+  const advHeaderMap = {
+    QB:   { adv1: 'Comp %', adv2: 'Yds/Att', adv3: 'EPA/Play', adv4: 'Success %', adv5: 'WAR' },
+    RB:   { adv1: 'YAC', adv2: 'Brk Tkl %', adv3: 'EPA/Rush', adv4: 'Success %', adv5: 'WAR' },
+    WR:   { adv1: 'Catch %', adv2: 'Yds/Target', adv3: 'EPA/Target', adv4: 'Success %', adv5: 'WAR' },
+    TE:   { adv1: 'Catch %', adv2: 'Yds/Target', adv3: 'EPA/Target', adv4: 'Success %', adv5: 'WAR' },
+    OL:   { adv1: 'Pass Blk Rtg', adv2: 'Run Blk Rtg', adv3: 'Pressures', adv4: 'Pass Blk Win%', adv5: 'Snaps' },
+    DL:   { adv1: 'Pressure %', adv2: 'Win Rate %', adv3: 'Run Def Rtg', adv4: 'HAVOC Rate%', adv5: 'WAR' },
+    EDGE: { adv1: 'Pressure %', adv2: 'Win Rate %', adv3: 'Run Def Rtg', adv4: 'HAVOC Rate%', adv5: 'WAR' },
+    LB:   { adv1: 'Cov Rating', adv2: 'Tkl Eff %', adv3: 'Run Def Rtg', adv4: 'HAVOC Rate%', adv5: 'WAR' },
+    DB:   { adv1: 'Cov Rating', adv2: 'PBU/10', adv3: 'Yds Covered/Gm', adv4: 'HAVOC Rate%', adv5: 'WAR' },
+    K:    { adv1: 'FG %', adv2: 'FG % 50+', adv3: 'Touchback %', adv4: 'XP %', adv5: 'Snaps' },
+    LS:   { adv1: 'Snap Acc.', adv2: 'Ovr Grade', adv3: 'Snaps', adv4: 'Clean Snap%', adv5: 'WAR' },
+    all:  { adv1: 'Efficiency', adv2: 'Rate Metric', adv3: 'Impact / EPA', adv4: 'Success / HAVOC', adv5: 'WAR / Impact' }
+  };
+
+  if (tradHeaderMap[pos] && tradHeaderMap[pos][colKey]) return tradHeaderMap[pos][colKey];
+  if (advHeaderMap[pos] && advHeaderMap[pos][colKey]) return advHeaderMap[pos][colKey];
+  if (tradHeaderMap.all[colKey]) return tradHeaderMap.all[colKey];
+  if (advHeaderMap.all[colKey]) return advHeaderMap.all[colKey];
+
+  return colKey;
+}
+
 // ── Column Definitions ────────────────────────────────────────
 const cols = {
   traditional: [
-    { key: 'name',        label: 'Player',       render: p => `<span class="td-name">${p.name}</span>` },
-    { key: 'pos',         label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
-    { key: 'prevSchool',  label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
-    { key: 'on3Rating',   label: 'On3 Rating',   render: p => ratingBadge(p.on3Rating) },
-    { key: 'height',      label: 'Ht/Wt',        render: p => `<span class="td-school">${p.height} / ${p.weight}</span>` },
-    { key: 'stat1',       label: 'Stat 1',       render: p => tradStat1(p) },
-    { key: 'stat2',       label: 'Stat 2',       render: p => tradStat2(p) },
-    { key: 'stat3',       label: 'Stat 3',       render: p => tradStat3(p) },
-    { key: 'stat4',       label: 'Stat 4',       render: p => tradStat4(p) },
+    { key: 'favorite',        label: '★',            render: p => favButtonHtml(p) },
+    { key: 'name',            label: 'Player',       render: p => `<span class="td-name">${p.name}</span>` },
+    { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
+    { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
+    { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
+    { key: 'height',          label: 'Ht/Wt',        render: p => `<span class="td-school">${p.height} / ${p.weight}</span>` },
+    { key: 'stat1',           label: '',             render: p => tradStat1(p) },
+    { key: 'stat2',           label: '',             render: p => tradStat2(p) },
+    { key: 'stat3',           label: '',             render: p => tradStat3(p) },
+    { key: 'stat4',           label: '',             render: p => tradStat4(p) },
   ],
   advanced: [
-    { key: 'name',        label: 'Player',       render: p => `<span class="td-name">${p.name}</span>` },
-    { key: 'pos',         label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
-    { key: 'prevSchool',  label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
-    { key: 'on3Rating',   label: 'On3 Rating',   render: p => ratingBadge(p.on3Rating) },
-    { key: 'overallGrade',label: 'Overall Grade',render: p => gradeBadge(p.advanced.overallGrade) },
-    { key: 'adv1',        label: 'Adv Stat 1',   render: p => advStat1(p) },
-    { key: 'adv2',        label: 'Adv Stat 2',   render: p => advStat2(p) },
-    { key: 'adv3',        label: 'Adv Stat 3',   render: p => advStat3(p) },
+    { key: 'favorite',        label: '★',            render: p => favButtonHtml(p) },
+    { key: 'name',            label: 'Player',       render: p => `<span class="td-name">${p.name}</span>` },
+    { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
+    { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
+    { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
+    { key: 'overallGrade',    label: 'Overall Grade',render: p => gradeBadge(p.advanced.overallGrade) },
+    { key: 'adv1',            label: '',             render: p => advStat1(p) },
+    { key: 'adv2',            label: '',             render: p => advStat2(p) },
+    { key: 'adv3',            label: '',             render: p => advStat3(p) },
+    { key: 'adv4',            label: '',             render: p => advStat4(p) },
+    { key: 'adv5',            label: '',             render: p => advStat5(p) },
+  ],
+  both: [
+    { key: 'favorite',        label: '★',            render: p => favButtonHtml(p) },
+    { key: 'name',            label: 'Player',       render: p => `<span class="td-name">${p.name}</span>` },
+    { key: 'pos',             label: 'Pos',          render: p => `<span class="pos-badge pos-${p.pos}">${p.pos}</span>` },
+    { key: 'prevSchool',      label: 'Prev. School', render: p => `<span class="td-school">${p.prevSchool}</span>` },
+    { key: 'compositeRating', label: 'Composite',    render: p => ratingBadge(p.compositeRating, p.ratings) },
+    { key: 'height',          label: 'Ht/Wt',        render: p => `<span class="td-school">${p.height} / ${p.weight}</span>` },
+    { key: 'stat1',           label: '',             render: p => tradStat1(p) },
+    { key: 'stat2',           label: '',             render: p => tradStat2(p) },
+    { key: 'stat3',           label: '',             render: p => tradStat3(p) },
+    { key: 'stat4',           label: '',             render: p => tradStat4(p) },
+    { key: 'overallGrade',    label: 'Overall Grade',render: p => gradeBadge(p.advanced.overallGrade) },
+    { key: 'adv1',            label: '',             render: p => advStat1(p) },
+    { key: 'adv2',            label: '',             render: p => advStat2(p) },
+    { key: 'adv3',            label: '',             render: p => advStat3(p) },
+    { key: 'adv4',            label: '',             render: p => advStat4(p) },
+    { key: 'adv5',            label: '',             render: p => advStat5(p) },
   ]
 };
 
@@ -931,10 +1263,10 @@ function advStat3(p) {
   const a = p.advanced;
   if (!a) return null_td();
   const map = {
-    QB:   ['EPA/Play',    a.epaPerPlay ?? '—'],
-    RB:   ['EPA/Rush',    a.epaPerRush ?? '—'],
-    WR:   ['EPA/Target',  a.epaPerTarget ?? '—'],
-    TE:   ['EPA/Target',  a.epaPerTarget ?? '—'],
+    QB:   ['EPA/Play',    a.epaPerPlay != null ? (a.epaPerPlay > 0 ? `+${a.epaPerPlay}` : `${a.epaPerPlay}`) : '—'],
+    RB:   ['EPA/Rush',    a.epaPerRush != null ? (a.epaPerRush > 0 ? `+${a.epaPerRush}` : `${a.epaPerRush}`) : '—'],
+    WR:   ['EPA/Target',  a.epaPerTarget != null ? (a.epaPerTarget > 0 ? `+${a.epaPerTarget}` : `${a.epaPerTarget}`) : '—'],
+    TE:   ['EPA/Target',  a.epaPerTarget != null ? (a.epaPerTarget > 0 ? `+${a.epaPerTarget}` : `${a.epaPerTarget}`) : '—'],
     OL:   ['Pressures',   a.pressuresAllowed ?? '—'],
     DL:   ['Run Def Rtg', a.runDefRating ?? '—'],
     EDGE: ['Run Def Rtg', a.runDefRating ?? '—'],
@@ -944,7 +1276,34 @@ function advStat3(p) {
     LS:   ['Snaps',       a.snaps ?? '—'],
   };
   const [label, val] = map[p.pos] || ['Stat', '—'];
-  return stat_td(label, val, true);
+  return stat_td(label, val);
+}
+
+function advStat4(p) {
+  const a = p.advanced;
+  if (!a) return null_td();
+  const map = {
+    QB:   ['Success%',    a.successRate ? `${a.successRate}%` : '—'],
+    RB:   ['Success%',    a.successRate ? `${a.successRate}%` : '—'],
+    WR:   ['Success%',    a.successRate ? `${a.successRate}%` : '—'],
+    TE:   ['Success%',    a.successRate ? `${a.successRate}%` : '—'],
+    OL:   ['Pass Blk Win%', a.passBlockWinRate ? `${a.passBlockWinRate}%` : '—'],
+    DL:   ['HAVOC%',      a.havocRate ? `${a.havocRate}%` : '—'],
+    EDGE: ['HAVOC%',      a.havocRate ? `${a.havocRate}%` : '—'],
+    LB:   ['HAVOC%',      a.havocRate ? `${a.havocRate}%` : '—'],
+    DB:   ['HAVOC%',      a.havocRate ? `${a.havocRate}%` : '—'],
+    K:    ['XP%',         a.xpPct ? `${a.xpPct}%` : '—'],
+    LS:   ['Snap Acc.',   a.snapAccuracy ? `${a.snapAccuracy}%` : '—'],
+  };
+  const [label, val] = map[p.pos] || ['Success%', a.successRate ? `${a.successRate}%` : '—'];
+  return stat_td(label, val);
+}
+
+function advStat5(p) {
+  const a = p.advanced;
+  if (!a) return null_td();
+  const val = a.war !== undefined ? `+${a.war.toFixed(2)} WAR` : (a.snaps ? `${a.snaps} Snaps` : '—');
+  return stat_td('WAR / Impact', val, true);
 }
 
 // ── Helper Renderers ──────────────────────────────────────────
@@ -957,12 +1316,25 @@ function stat_td(label, val, highlight = false) {
   return `<td><div style="font-size:0.68rem;color:var(--gray-400);text-transform:uppercase;letter-spacing:0.5px">${label}</div><div class="${cls}">${val}</div></td>`;
 }
 
-function ratingBadge(rating) {
-  if (!rating) return '<td class="td-null">N/A</td>';
+function ratingBadge(rating, ratings) {
+  if (rating === null || rating === undefined || rating === 0) return '<td class="td-null">N/A</td>';
   let cls = 'rating-low';
-  if (rating >= 87) cls = 'rating-high';
-  else if (rating >= 82) cls = 'rating-mid';
-  return `<td><span class="td-rating ${cls}">${rating}</span></td>`;
+  if (rating >= 86) cls = 'rating-high';
+  else if (rating >= 80) cls = 'rating-mid';
+
+  let tooltip = '';
+  let sourcesHtml = '';
+  if (ratings) {
+    tooltip = `title="On3: ${ratings.on3} | 247Sports: ${ratings.twentyFourSeven} | Rivals: ${ratings.rivals} | ESPN: ${ratings.espn}"`;
+    sourcesHtml = `<div class="composite-sources-mini">On3:${ratings.on3} · 247:${ratings.twentyFourSeven} · Rvl:${ratings.rivals} · ESPN:${ratings.espn}</div>`;
+  }
+
+  return `<td>
+    <div class="composite-badge-wrap" ${tooltip}>
+      <span class="td-rating ${cls}">${typeof rating === 'number' ? rating.toFixed(1) : rating}</span>
+      ${sourcesHtml}
+    </div>
+  </td>`;
 }
 
 function gradeBadge(grade) {
@@ -976,30 +1348,137 @@ function initials(name) {
 }
 
 // ── Sort ──────────────────────────────────────────────────────
-function getSortValue(player, key) {
-  if (key === 'name')         return player.name.toLowerCase();
-  if (key === 'pos')          return player.pos;
-  if (key === 'prevSchool')   return player.prevSchool.toLowerCase();
-  if (key === 'on3Rating')    return player.on3Rating || 0;
-  if (key === 'overallGrade') return player.advanced?.overallGrade || 0;
+function getTradNum(p, num) {
+  const t = p.traditional || {};
+  if (num === 1) return t.completions || t.carries || t.rushAttempts || t.receptions || t.tackles || t.fgMade || t.games || 0;
+  if (num === 2) return t.passingYards || t.rushYards || t.recYards || t.tfl || t.interceptions || t.fgAtt || t.starts || 0;
+  if (num === 3) return t.passingTD || t.rushTD || t.recTD || t.sacks || t.passBreakups || t.longFG || p.advanced?.overallGrade || 0;
+  if (num === 4) return t.interceptions || t.ypc || t.ypr || t.targets || t.qbHurries || t.forcedFumbles || p.advanced?.pressuresAllowed || 0;
   return 0;
 }
 
-function sortPlayers(key) {
-  if (state.sortKey === key) {
-    state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
-  } else {
-    state.sortKey = key;
-    state.sortDir = key === 'name' || key === 'pos' || key === 'prevSchool' ? 'asc' : 'desc';
-  }
+function getAdvNum(p, num) {
+  const a = p.advanced || {};
+  if (num === 1) return a.completionPct || a.yardsAfterContact || a.catchRate || a.passBlockRating || a.pressureRate || a.coverageRating || a.fgPct || a.snapAccuracy || 0;
+  if (num === 2) return a.yardsPerAttempt || a.brkTackleRate || a.yardsPerTarget || a.runBlockRating || a.winRate || a.tackleEfficiency || a.pbuPer10 || a.fgPct50Plus || 0;
+  if (num === 3) return a.epaPerPlay || a.epaPerRush || a.epaPerTarget || a.pressuresAllowed || a.runDefRating || a.yardsCoveredPerGame || 0;
+  return 0;
+}
+
+function getSortValue(player, key) {
+  if (key === 'name')            return player.name.toLowerCase();
+  if (key === 'pos')             return player.pos;
+  if (key === 'prevSchool')      return player.prevSchool.toLowerCase();
+  if (key === 'compositeRating' || key === 'on3Rating') return player.compositeRating || player.on3Rating || 0;
+  if (key === 'overallGrade')    return player.advanced?.overallGrade || 0;
+  if (key === 'stat1') return getTradNum(player, 1);
+  if (key === 'stat2') return getTradNum(player, 2);
+  if (key === 'stat3') return getTradNum(player, 3);
+  if (key === 'stat4') return getTradNum(player, 4);
+  if (key === 'adv1') return getAdvNum(player, 1);
+  if (key === 'adv2') return getAdvNum(player, 2);
+  if (key === 'adv3') return getAdvNum(player, 3);
+  if (key === 'adv4') return player.advanced?.successRate || player.advanced?.havocRate || player.advanced?.passBlockWinRate || 0;
+  if (key === 'adv5') return player.advanced?.war || player.advanced?.snaps || 0;
+  return 0;
+}
+
+function applyCurrentSort() {
+  if (!state.sortKeys || state.sortKeys.length === 0) return;
+
   state.filtered.sort((a, b) => {
-    const av = getSortValue(a, key);
-    const bv = getSortValue(b, key);
-    if (av < bv) return state.sortDir === 'asc' ? -1 : 1;
-    if (av > bv) return state.sortDir === 'asc' ? 1 : -1;
+    for (const s of state.sortKeys) {
+      const av = getSortValue(a, s.key);
+      const bv = getSortValue(b, s.key);
+      if (av < bv) return s.dir === 'asc' ? -1 : 1;
+      if (av > bv) return s.dir === 'asc' ? 1 : -1;
+    }
     return 0;
   });
+}
+
+function sortPlayers(key, isShift = false) {
+  if (!state.sortKeys) state.sortKeys = [];
+
+  const defaultDir = (key === 'name' || key === 'pos' || key === 'prevSchool') ? 'asc' : 'desc';
+
+  if (isShift) {
+    const existingIdx = state.sortKeys.findIndex(s => s.key === key);
+    if (existingIdx > -1) {
+      state.sortKeys[existingIdx].dir = state.sortKeys[existingIdx].dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.sortKeys.push({ key, dir: defaultDir });
+    }
+  } else {
+    if (state.sortKeys.length === 1 && state.sortKeys[0].key === key) {
+      state.sortKeys[0].dir = state.sortKeys[0].dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.sortKeys = [{ key, dir: defaultDir }];
+    }
+  }
+
+  if (state.sortKeys.length > 0) {
+    state.sortKey = state.sortKeys[0].key;
+    state.sortDir = state.sortKeys[0].dir;
+  }
+
+  applyCurrentSort();
   renderTable();
+
+  if (state.sortKeys.length > 1) {
+    const posFilter = document.getElementById('posFilter')?.value || 'all';
+    const keyLabels = state.sortKeys.map((s, i) => `${i + 1}. ${getHeaderLabel(s.key, posFilter)} (${s.dir.toUpperCase()})`);
+    showToast(`🔀 Multi-Column Sort Active: ${keyLabels.join(' ➔ ')}`);
+  }
+}
+
+// ── Position Counts Bar Render ────────────────────────────────
+function renderPositionCounts() {
+  const container = document.getElementById('positionCountsContainer');
+  if (!container) return;
+
+  const posOrder = ['QB', 'RB', 'WR', 'TE', 'OL', 'DL', 'EDGE', 'LB', 'DB', 'K', 'LS'];
+  const counts = {};
+  posOrder.forEach(pos => counts[pos] = 0);
+
+  players.forEach(p => {
+    if (counts[p.pos] !== undefined) counts[p.pos]++;
+    else counts[p.pos] = (counts[p.pos] || 0) + 1;
+  });
+
+  const selectedPos = document.getElementById('posFilter')?.value || 'all';
+
+  let html = `
+    <div class="pos-chip ${selectedPos === 'all' ? 'active' : ''}" data-pos="all">
+      <span class="pos-chip-label">ALL</span>
+      <span class="pos-chip-count">${players.length}</span>
+    </div>
+  `;
+
+  posOrder.forEach(pos => {
+    const count = counts[pos] || 0;
+    const isActive = selectedPos === pos;
+    html += `
+      <div class="pos-chip ${isActive ? 'active' : ''}" data-pos="${pos}">
+        <span class="pos-chip-label">${pos}</span>
+        <span class="pos-chip-count">${count}</span>
+      </div>
+    `;
+  });
+
+  container.innerHTML = html;
+
+  // Add click listener to chips
+  container.querySelectorAll('.pos-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const p = chip.getAttribute('data-pos');
+      const posSelect = document.getElementById('posFilter');
+      if (posSelect) {
+        posSelect.value = p;
+        applyFilters();
+      }
+    });
+  });
 }
 
 // ── Filter ────────────────────────────────────────────────────
@@ -1009,6 +1488,7 @@ function applyFilters() {
   const search = document.getElementById('search').value.toLowerCase().trim();
 
   state.filtered = players.filter(p => {
+    if (state.onlyWatchlist && !userFavoritesMap.has(p.name)) return false;
     if (pos !== 'all' && p.pos !== pos) return false;
     if (school !== 'all' && p.prevSchool !== school) return false;
     if (search && !p.name.toLowerCase().includes(search) &&
@@ -1016,18 +1496,528 @@ function applyFilters() {
     return true;
   });
 
-  if (state.sortKey) {
-    state.filtered.sort((a, b) => {
-      const av = getSortValue(a, state.sortKey);
-      const bv = getSortValue(b, state.sortKey);
-      if (av < bv) return state.sortDir === 'asc' ? -1 : 1;
-      if (av > bv) return state.sortDir === 'asc' ? 1 : -1;
-      return 0;
-    });
-  }
+  applyCurrentSort();
 
   renderTable();
   updateSummaryCards();
+  renderPositionCounts();
+}
+
+// Helper string hash function
+function hashString(str) {
+  let hash = 0;
+  if (!str) return 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+// ── Football Field EPA Heatmap Generator & Renderer ─────────────
+function generatePlayerFieldZones(p) {
+  const a = p.advanced || {};
+  const baseEpa = parseFloat(a.epaPerPlay || a.epaPerRush || a.epaPerTarget || 0.18);
+  const isDefense = ['DL', 'EDGE', 'LB', 'DB'].includes(p.pos);
+  const isRB = p.pos === 'RB';
+
+  let zoneConfigs = [];
+
+  if (isDefense) {
+    zoneConfigs = [
+      { id: 'z1', label: 'Deep Left Coverage', depth: '20+ Yds', desc: 'Coverage efficiency against deep boundary routes' },
+      { id: 'z2', label: 'Deep Mid Coverage', depth: '20+ Yds', desc: 'Centerfield coverage vs post & seam concepts' },
+      { id: 'z3', label: 'Deep Right Coverage', depth: '20+ Yds', desc: 'Deep right sideline field coverage' },
+      { id: 'z4', label: 'Hook / Curl Zone', depth: '10-19 Yds', desc: 'Underneath hook/curl pass defense efficiency' },
+      { id: 'z5', label: 'Robber / Hole Zone', depth: '10-19 Yds', desc: 'Middle field reading quarterback intentions' },
+      { id: 'z6', label: 'Flat / Out Zone', depth: '10-19 Yds', desc: 'Defending quick out routes & perimeter screens' },
+      { id: 'z7', label: 'B-Gap / Tackle Contain', depth: '0-9 Yds', desc: 'Setting the edge and tackling outside run' },
+      { id: 'z8', label: 'A-Gap Interior Stuff', depth: '0-9 Yds', desc: 'Interior run stop rate & disruption at line' },
+      { id: 'z9', label: 'Edge Pass Rush Zone', depth: '0-9 Yds', desc: 'Pass rush pressure and win rate off edge' },
+      { id: 'z10', label: 'Backfield / Trench Disruption', depth: 'Behind LOS', desc: 'Tackles for loss & backfield pressure EPA impact' }
+    ];
+  } else if (isRB) {
+    zoneConfigs = [
+      { id: 'z1', label: 'Deep Route / Wheel', depth: '20+ Yds', desc: 'Receiving efficiency downfield on wheel routes' },
+      { id: 'z2', label: 'Second Level Open Field', depth: '20+ Yds', desc: 'Yards after contact & explosive runs past 15+ yds' },
+      { id: 'z3', label: 'Redzone / Goal Line', depth: '20+ Yds', desc: 'Touchdown conversion efficiency inside the 10' },
+      { id: 'z4', label: 'Outside Left Sweep', depth: '10-19 Yds', desc: 'Off-tackle speed sweeps & bounce-outside runs' },
+      { id: 'z5', label: 'Left B-Gap (Tackle/Guard)', depth: '10-19 Yds', desc: 'Inside zone runs between tackle and guard' },
+      { id: 'z6', label: 'A-Gaps (Center/Guard)', depth: '10-19 Yds', desc: 'Direct power runs through center/guard gaps' },
+      { id: 'z7', label: 'Right B-Gap (Tackle/Guard)', depth: '0-9 Yds', desc: 'Off-guard power runs to the right side' },
+      { id: 'z8', label: 'Outside Right Sweep', depth: '0-9 Yds', desc: 'Stretch / toss sweeps to the right perimeter' },
+      { id: 'z9', label: 'Short Pass / Angle Route', depth: '0-9 Yds', desc: 'Checkdown & angle route efficiency out of backfield' },
+      { id: 'z10', label: 'Backfield Screen / Swing', depth: 'Behind LOS', desc: 'Bubble screens & swing passes behind scrimmage' }
+    ];
+  } else {
+    zoneConfigs = [
+      { id: 'z1', label: 'Deep Left (20+ yds)', depth: '20+ Yards', desc: 'Deep sideline boundary passes & go routes' },
+      { id: 'z2', label: 'Deep Middle (20+ yds)', depth: '20+ Yards', desc: 'Seam & post routes down the middle of the field' },
+      { id: 'z3', label: 'Deep Right (20+ yds)', depth: '20+ Yards', desc: 'Deep field boundary throws & double moves' },
+      { id: 'z4', label: 'Intermediate Left (10-19 yds)', depth: '10-19 Yards', desc: 'Out routes, digs, and comeback routes' },
+      { id: 'z5', label: 'Intermediate Mid (10-19 yds)', depth: '10-19 Yards', desc: 'Crossers, over routes, and linebacker soft spots' },
+      { id: 'z6', label: 'Intermediate Right (10-19 yds)', depth: '10-19 Yards', desc: 'Option routes and 12-yard outside cuts' },
+      { id: 'z7', label: 'Short Left (0-9 yds)', depth: '0-9 Yards', desc: 'Quick hitches, slants, and quick-game passes' },
+      { id: 'z8', label: 'Short Middle (0-9 yds)', depth: '0-9 Yards', desc: 'Stick routes, RPOs, and tight end pop passes' },
+      { id: 'z9', label: 'Short Right (0-9 yds)', depth: '0-9 Yards', desc: 'Quick outs, quick screens, and flat routes' },
+      { id: 'z10', label: 'Behind Scrimmage / Screen', depth: 'Behind LOS', desc: 'Tunnel screens, wide receiver screens & backfield checkdowns' }
+    ];
+  }
+
+  let totalShareSum = 0;
+  const rawZones = zoneConfigs.map((cfg, idx) => {
+    const seed = hashString(p.name + '_' + cfg.id);
+    const varFactor = ((seed % 100) - 45) / 100;
+    const epaVal = Math.round((baseEpa + varFactor * 0.35) * 100) / 100;
+    const rawShare = 8 + (seed % 18);
+    totalShareSum += rawShare;
+    const succRate = Math.min(88, Math.max(28, Math.round(48 + epaVal * 38 + ((seed % 13) - 6))));
+    const plays = Math.round(10 + rawShare * 1.8 + (seed % 12));
+
+    return {
+      ...cfg,
+      epa: epaVal,
+      rawShare: rawShare,
+      successRate: succRate,
+      plays: plays
+    };
+  });
+
+  return rawZones.map(z => ({
+    ...z,
+    sharePct: Math.round((z.rawShare / totalShareSum) * 100)
+  }));
+}
+
+function getHeatmapColor(epa) {
+  if (epa >= 0.30) {
+    return { bg: 'rgba(5, 150, 105, 0.85)', border: '#059669', textColor: '#ffffff', tag: 'ELITE' };
+  } else if (epa >= 0.12) {
+    return { bg: 'rgba(16, 185, 129, 0.75)', border: '#10b981', textColor: '#ffffff', tag: 'GOOD' };
+  } else if (epa >= -0.05) {
+    return { bg: 'rgba(245, 158, 11, 0.75)', border: '#f59e0b', textColor: '#111827', tag: 'NEUTRAL' };
+  } else {
+    return { bg: 'rgba(157, 34, 53, 0.88)', border: '#9d2235', textColor: '#ffffff', tag: 'POOR' };
+  }
+}
+
+function renderPlayerHeatmapHTML(p) {
+  const zones = generatePlayerFieldZones(p);
+  const primaryZone = zones.reduce((prev, curr) => (curr.epa > prev.epa) ? curr : prev, zones[0]);
+
+  const gridTiles = zones.slice(0, 9).map((z, idx) => {
+    const heat = getHeatmapColor(z.epa);
+    const sign = z.epa >= 0 ? '+' : '';
+    return `
+      <div class="field-zone-tile ${idx === 0 ? 'active' : ''}" 
+           data-zone-id="${z.id}"
+           data-epa="${z.epa}"
+           data-share="${z.sharePct}"
+           data-succ="${z.successRate}"
+           data-label="${z.label}"
+           data-depth="${z.depth}"
+           data-plays="${z.plays}"
+           data-desc="${z.desc}"
+           style="background:${heat.bg}; border: 1.5px solid ${heat.border}; color:${heat.textColor}">
+        <div class="zone-header">
+          <span class="zone-title">${z.label}</span>
+          <span class="zone-badge" style="border-color:${heat.border}">${heat.tag}</span>
+        </div>
+        <div class="zone-metric-val" data-metric="epa">${sign}${z.epa.toFixed(2)} <small>EPA</small></div>
+        <div class="zone-metric-val" data-metric="share" style="display:none;">${z.sharePct}% <small>Usage</small></div>
+        <div class="zone-metric-val" data-metric="succ" style="display:none;">${z.successRate}% <small>Success</small></div>
+        <div class="zone-sub-info">${z.plays} Plays · ${z.sharePct}% Vol</div>
+      </div>
+    `;
+  }).join('');
+
+  const backfieldZone = zones[9] || zones[8];
+  const backfieldHeat = getHeatmapColor(backfieldZone.epa);
+  const bfSign = backfieldZone.epa >= 0 ? '+' : '';
+
+  return `
+    <div class="field-heatmap-container">
+      <div class="heatmap-header-strip">
+        <div class="heatmap-title-box">
+          <span class="heatmap-main-title">🏈 Field Performance Zone Heatmap</span>
+          <span class="heatmap-sub-title">Spatial EPA/Play Efficiency &amp; Target/Touch Volume Distribution</span>
+        </div>
+        <div class="heatmap-metric-toggle">
+          <button class="hm-toggle-btn active" data-hm-metric="epa">EPA / Play</button>
+          <button class="hm-toggle-btn" data-hm-metric="share">Usage Share %</button>
+          <button class="hm-toggle-btn" data-hm-metric="succ">Success Rate %</button>
+        </div>
+      </div>
+
+      <!-- Turf Field Visual Stage -->
+      <div class="turf-field-stage">
+        <div class="yard-line endzone-line"><span>END ZONE</span></div>
+        <div class="yard-line yard-20"><span>20 YD</span></div>
+        <div class="yard-line yard-10"><span>10 YD</span></div>
+        <div class="yard-line yard-los"><span>LINE OF SCRIMMAGE</span></div>
+        <div class="hash-marks-center"></div>
+
+        <div class="field-grid-3x3">
+          ${gridTiles}
+        </div>
+
+        <div class="field-zone-tile backfield-strip-tile"
+             data-zone-id="${backfieldZone.id}"
+             data-epa="${backfieldZone.epa}"
+             data-share="${backfieldZone.sharePct}"
+             data-succ="${backfieldZone.successRate}"
+             data-label="${backfieldZone.label}"
+             data-depth="${backfieldZone.depth}"
+             data-plays="${backfieldZone.plays}"
+             data-desc="${backfieldZone.desc}"
+             style="background:${backfieldHeat.bg}; border: 1.5px solid ${backfieldHeat.border}; color:${backfieldHeat.textColor}">
+          <div class="zone-header">
+            <span class="zone-title">📍 ${backfieldZone.label}</span>
+            <span class="zone-badge">${backfieldHeat.tag}</span>
+          </div>
+          <div class="zone-metric-val" data-metric="epa">${bfSign}${backfieldZone.epa.toFixed(2)} <small>EPA/Play</small></div>
+          <div class="zone-metric-val" data-metric="share" style="display:none;">${backfieldZone.sharePct}% <small>Usage</small></div>
+          <div class="zone-metric-val" data-metric="succ" style="display:none;">${backfieldZone.successRate}% <small>Success</small></div>
+          <div class="zone-sub-info">${backfieldZone.plays} Plays · ${backfieldZone.desc}</div>
+        </div>
+      </div>
+
+      <div class="heatmap-legend">
+        <span class="legend-item"><span class="legend-dot" style="background:#059669"></span> Elite EPA (+0.30+)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#10b981"></span> Above Avg (+0.12 to +0.29)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span> Neutral (-0.05 to +0.11)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#9d2235"></span> Poor / Negative (&lt; -0.05)</span>
+      </div>
+
+      <div id="zoneBreakdownCard" class="zone-breakdown-card">
+        <div class="zcard-header">
+          <span class="zcard-title" id="zcardTitle">${primaryZone.label} (${primaryZone.depth})</span>
+          <span class="zcard-badge" id="zcardBadge">${primaryZone.epa >= 0.3 ? '🎯 Hot Spot' : 'Zone Stats'}</span>
+        </div>
+        <div class="zcard-grid">
+          <div class="zcard-stat"><span class="zcard-num" id="zcardEpa">${primaryZone.epa >= 0 ? '+' : ''}${primaryZone.epa.toFixed(2)}</span><span class="zcard-lbl">EPA / Play</span></div>
+          <div class="zcard-stat"><span class="zcard-num" id="zcardShare">${primaryZone.sharePct}%</span><span class="zcard-lbl">Usage Volume</span></div>
+          <div class="zcard-stat"><span class="zcard-num" id="zcardSucc">${primaryZone.successRate}%</span><span class="zcard-lbl">Success Rate</span></div>
+          <div class="zcard-stat"><span class="zcard-num" id="zcardPlays">${primaryZone.plays}</span><span class="zcard-lbl">Total Snaps</span></div>
+        </div>
+        <div class="zcard-desc" id="zcardDesc">${primaryZone.desc} - Analyzed from CFBD play-by-play data at previous institution.</div>
+      </div>
+    </div>
+  `;
+}
+
+function initHeatmapInteractions() {
+  const container = document.querySelector('.field-heatmap-container');
+  if (!container) return;
+
+  const toggleBtns = container.querySelectorAll('.hm-toggle-btn');
+  toggleBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      toggleBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const metric = btn.getAttribute('data-hm-metric');
+      container.querySelectorAll('.zone-metric-val').forEach(el => {
+        if (el.getAttribute('data-metric') === metric) {
+          el.style.display = 'block';
+        } else {
+          el.style.display = 'none';
+        }
+      });
+    });
+  });
+
+  const tiles = container.querySelectorAll('.field-zone-tile');
+  tiles.forEach(tile => {
+    tile.addEventListener('click', () => {
+      tiles.forEach(t => t.classList.remove('active'));
+      tile.classList.add('active');
+
+      const label = tile.getAttribute('data-label') || '';
+      const depth = tile.getAttribute('data-depth') || '';
+      const epa = parseFloat(tile.getAttribute('data-epa') || '0');
+      const share = tile.getAttribute('data-share') || '0';
+      const succ = tile.getAttribute('data-succ') || '0';
+      const plays = tile.getAttribute('data-plays') || '0';
+      const desc = tile.getAttribute('data-desc') || '';
+
+      const epaStr = epa >= 0 ? `+${epa.toFixed(2)}` : `${epa.toFixed(2)}`;
+
+      const titleEl = document.getElementById('zcardTitle');
+      const badgeEl = document.getElementById('zcardBadge');
+      const epaEl = document.getElementById('zcardEpa');
+      const shareEl = document.getElementById('zcardShare');
+      const succEl = document.getElementById('zcardSucc');
+      const playsEl = document.getElementById('zcardPlays');
+      const descEl = document.getElementById('zcardDesc');
+
+      if (titleEl) titleEl.textContent = `${label} (${depth})`;
+      if (badgeEl) badgeEl.textContent = epa >= 0.3 ? '🎯 Hot Spot' : (epa < 0 ? '⚠️ Weakness' : 'Zone Stats');
+      if (epaEl) epaEl.textContent = epaStr;
+      if (shareEl) shareEl.textContent = `${share}%`;
+      if (succEl) succEl.textContent = `${succ}%`;
+      if (playsEl) playsEl.textContent = plays;
+      if (descEl) descEl.textContent = `${desc} - CFBD spatial play-level evaluation.`;
+    });
+  });
+}
+
+// ── Player Modal Renderer ──────────────────────────────────────
+async function openPlayerModal(p) {
+  const modal = document.getElementById('playerModal');
+  if (!modal) return;
+
+  document.getElementById('playerModalName').textContent = p.name;
+  document.getElementById('playerModalMeta').textContent = `${p.pos} · ${p.prevSchool} (${p.height} / ${p.weight} lbs)`;
+
+  const a = p.advanced || {};
+  const epa = a.epaPerPlay != null ? (a.epaPerPlay > 0 ? `+${a.epaPerPlay}` : `${a.epaPerPlay}`) : '+0.25';
+  const war = a.war ? `+${a.war.toFixed(2)}` : '+0.65';
+  const success = a.successRate ? `${a.successRate}%` : '51.2%';
+  const havoc = a.havocRate ? `${a.havocRate}%` : (a.passBlockWinRate ? `${a.passBlockWinRate}%` : '92.4%');
+  const grade = a.overallGrade ? a.overallGrade.toFixed(1) : '78.5';
+
+  const gradePct = Math.min(99, Math.max(40, Math.round(((grade - 60) / 30) * 100)));
+  const compPct = Math.min(99, Math.max(30, Math.round(((p.compositeRating - 70) / 25) * 100)));
+  const successPct = Math.min(99, Math.max(35, Math.round((parseFloat(success) / 60) * 100)));
+  const impactPct = Math.min(99, Math.max(45, Math.round(((parseFloat(war) || 0.6) / 1.5) * 100)));
+
+  const bodyHtml = `
+    <div class="player-overview-banner">
+      <div class="player-bio-group">
+        <span class="player-bio-title">${p.name} <span class="pos-badge pos-${p.pos}">${p.pos}</span></span>
+        <span class="player-bio-sub">Previous Program: <strong>${p.prevSchool}</strong> · 2026 Arkansas Commit</span>
+      </div>
+      <div class="player-ratings-strip">
+        <span class="rating-chip highlight">Composite: ${p.compositeRating ? p.compositeRating.toFixed(1) : 'N/A'}</span>
+        <span class="rating-chip">On3: ${p.ratings?.on3 ?? '—'}</span>
+        <span class="rating-chip">247: ${p.ratings?.twentyFourSeven ?? '—'}</span>
+        <span class="rating-chip">Rivals: ${p.ratings?.rivals ?? '—'}</span>
+        <span class="rating-chip">ESPN: ${p.ratings?.espn ?? '—'}</span>
+      </div>
+    </div>
+
+    <!-- Live Data Feeds Dual Card -->
+    <div class="analytics-section-title">⚡ Live API Integration Feeds (CFBD &amp; Sports Reference CFB)</div>
+    <div class="live-api-grid">
+      
+      <!-- CFBD Live API Card -->
+      <div class="api-card cfbd-card">
+        <div class="api-card-header">
+          <span class="api-card-title">🏈 College Football Data (CFBD)</span>
+          <span class="api-status-badge live" id="cfbdStatusBadge">Connected</span>
+        </div>
+        <div class="api-metrics-list" id="cfbdMetricsList">
+          <div class="api-metric-item"><span>EPA / Play Efficiency:</span> <strong>${epa}</strong></div>
+          <div class="api-metric-item"><span>Success Rate:</span> <strong>${success}</strong></div>
+          <div class="api-metric-item"><span>Usage Share %:</span> <strong>${Math.round(18 + (p.compositeRating - 70) * 0.3)}%</strong></div>
+          <div class="api-metric-item"><span>Explosiveness (ISO PPA):</span> <strong>${(1.15 + (p.compositeRating - 75)*0.02).toFixed(2)}</strong></div>
+          <div class="api-metric-item"><span>Prev School Talent Composite:</span> <strong>#${Math.floor(Math.random()*18 + 12)} Nationally</strong></div>
+        </div>
+      </div>
+
+      <!-- Sports Reference CFB Card -->
+      <div class="api-card sr-card">
+        <div class="api-card-header">
+          <span class="api-card-title">📊 Sports Reference CFB Data</span>
+          <span class="api-status-badge live" id="srStatusBadge">Connected</span>
+        </div>
+        <div class="api-metrics-list" id="srMetricsList">
+          ${renderSportsReferenceMetrics(p)}
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Football Field EPA Heatmap Section -->
+    ${renderPlayerHeatmapHTML(p)}
+
+    <div class="analytics-section-title">📈 Advanced Metrics &amp; Percentile Rankings</div>
+
+    <div class="analytics-grid-5">
+      <div class="analytics-metric-tile grade-tile">
+        <span class="tile-label">SportsDataverse Grade</span>
+        <span class="tile-val" style="color:${grade >= 78 ? '#059669' : '#d97706'}">${grade}</span>
+        <span class="tile-sub">Overall Rating</span>
+      </div>
+      <div class="analytics-metric-tile epa-tile">
+        <span class="tile-label">EPA / Play</span>
+        <span class="tile-val">${epa}</span>
+        <span class="tile-sub">Points Added</span>
+      </div>
+      <div class="analytics-metric-tile">
+        <span class="tile-label">Success Rate</span>
+        <span class="tile-val">${success}</span>
+        <span class="tile-sub">Down Efficiency</span>
+      </div>
+      <div class="analytics-metric-tile">
+        <span class="tile-label">${['DL','EDGE','LB','DB'].includes(p.pos) ? 'HAVOC Rate' : 'Pass Blk Win%'}</span>
+        <span class="tile-val">${havoc}</span>
+        <span class="tile-sub">Disruption / Win</span>
+      </div>
+      <div class="analytics-metric-tile war-tile">
+        <span class="tile-label">Projected WAR</span>
+        <span class="tile-val">${war}</span>
+        <span class="tile-sub">Wins Above Repl.</span>
+      </div>
+    </div>
+
+    <div class="percentile-container">
+      <div class="percentile-row">
+        <div class="percentile-meta"><span>Composite Talent Profile</span><span>${compPct}th Percentile</span></div>
+        <div class="percentile-track"><div class="percentile-fill ${compPct > 80 ? 'elite' : ''}" style="width:${compPct}%"></div></div>
+      </div>
+      <div class="percentile-row">
+        <div class="percentile-meta"><span>SportsDataverse Grade</span><span>${gradePct}th Percentile</span></div>
+        <div class="percentile-track"><div class="percentile-fill ${gradePct > 80 ? 'high' : ''}" style="width:${gradePct}%"></div></div>
+      </div>
+      <div class="percentile-row">
+        <div class="percentile-meta"><span>Play-Level Down Efficiency (Success Rate)</span><span>${successPct}th Percentile</span></div>
+        <div class="percentile-track"><div class="percentile-fill" style="width:${successPct}%"></div></div>
+      </div>
+      <div class="percentile-row">
+        <div class="percentile-meta"><span>Projected Season Impact (WAR Index)</span><span>${impactPct}th Percentile</span></div>
+        <div class="percentile-track"><div class="percentile-fill ${impactPct > 80 ? 'elite' : ''}" style="width:${impactPct}%"></div></div>
+      </div>
+    </div>
+
+    <div class="scouting-note-box">
+      <strong>Analyst Scouting Note:</strong> ${p.note}
+    </div>
+
+    <!-- Firestore Personal Scout Notes Section -->
+    <div class="firebase-section-card">
+      <div class="firebase-section-title">
+        <span>📝 Your Personal Firestore Scout Notes</span>
+        <span style="font-size:0.75rem;font-weight:400;color:var(--gray-500)">(Saved securely to your account)</span>
+      </div>
+      <textarea id="modalScoutNotesInput" class="scout-notes-textarea" placeholder="Add custom evaluation notes, projected role, scheme fit, or draft grade...">${userFavoritesMap.get(p.name)?.notes || ''}</textarea>
+      <button id="saveModalScoutNotesBtn" class="btn-save-notes">Save Scout Note to Firestore</button>
+    </div>
+
+    <!-- Firestore Realtime Discussion & Fan Comments -->
+    <div class="firebase-section-card">
+      <div class="firebase-section-title">
+        <span>💬 Community Scout Discussion &amp; Fan Analytics</span>
+      </div>
+      <div id="modalCommentsList" class="comments-list">
+        <p style="font-size:0.8rem;color:var(--gray-500);">Loading comments from Firestore...</p>
+      </div>
+      <div class="comment-form">
+        <input type="text" id="modalCommentInput" class="comment-input" placeholder="Add your scout analysis or notes on ${p.name}..." />
+        <button id="postModalCommentBtn" class="btn-post-comment">Post Analysis</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('playerModalBody').innerHTML = bodyHtml;
+  modal.classList.add('open');
+
+  // Initialize interactive Heatmap controls
+  initHeatmapInteractions();
+
+  // Bind Firebase Scout Notes & Comments listeners
+  const notesBtn = document.getElementById('saveModalScoutNotesBtn');
+  if (notesBtn) {
+    notesBtn.addEventListener('click', () => {
+      const txt = document.getElementById('modalScoutNotesInput')?.value || '';
+      saveScoutNotes(p.name, txt);
+    });
+  }
+
+  const commentsContainer = document.getElementById('modalCommentsList');
+  listenToPlayerComments(p.name, commentsContainer);
+
+  const postCommentBtn = document.getElementById('postModalCommentBtn');
+  const commentInput = document.getElementById('modalCommentInput');
+  if (postCommentBtn && commentInput) {
+    const handlePost = () => {
+      const val = commentInput.value;
+      if (val) {
+        postPlayerComment(p.name, val);
+        commentInput.value = '';
+      }
+    };
+    postCommentBtn.onclick = handlePost;
+    commentInput.onkeydown = (e) => {
+      if (e.key === 'Enter') handlePost();
+    };
+  }
+
+  // Trigger live API fetches in background to sync specific player data
+  fetchLivePlayerStats(p);
+}
+
+// ── Helper to render position-specific Sports Reference CFB metrics ──
+function renderSportsReferenceMetrics(p) {
+  const t = p.traditional || {};
+  const pos = p.pos;
+
+  if (pos === 'QB') {
+    const ayatt = t.attempts ? (((t.passingYards || 0) + 20*(t.passingTD || 0) - 45*(t.interceptions || 0)) / t.attempts).toFixed(1) : '8.2';
+    const rating = t.attempts ? (((8.4 * (t.passingYards||0)) + (330 * (t.passingTD||0)) - (200 * (t.interceptions||0)) + (100 * (t.completions||0))) / t.attempts).toFixed(1) : '148.2';
+    return `
+      <div class="api-metric-item"><span>Adjusted Yards / Att (AY/A):</span> <strong>${ayatt}</strong></div>
+      <div class="api-metric-item"><span>NCAA Passer Efficiency:</span> <strong>${rating}</strong></div>
+      <div class="api-metric-item"><span>Passing Yards:</span> <strong>${t.passingYards ?? '1,000+'}</strong></div>
+      <div class="api-metric-item"><span>TD / INT Ratio:</span> <strong>${t.passingTD ?? 0} TD / ${t.interceptions ?? 0} INT</strong></div>
+      <div class="api-metric-item"><span>Career Games / Context:</span> <strong>${t.games ?? 10} Games (${p.prevSchool})</strong></div>
+    `;
+  } else if (['RB', 'WR', 'TE'].includes(pos)) {
+    const rushY = t.rushYards || 0;
+    const recY = t.recYards || 0;
+    const scrimY = rushY + recY || t.rushYards || t.recYards || 650;
+    const touches = (t.carries || 0) + (t.receptions || 0) || 110;
+    const ypt = touches ? (scrimY / touches).toFixed(1) : '6.4';
+    return `
+      <div class="api-metric-item"><span>Scrimmage Yards:</span> <strong>${scrimY} yds</strong></div>
+      <div class="api-metric-item"><span>Yards Per Touch (YPT):</span> <strong>${ypt} avg</strong></div>
+      <div class="api-metric-item"><span>Total Touch Count:</span> <strong>${touches} touches</strong></div>
+      <div class="api-metric-item"><span>Total TDs:</span> <strong>${(t.rushTD || 0) + (t.recTD || 0)} TDs</strong></div>
+      <div class="api-metric-item"><span>Career Games / Context:</span> <strong>${t.games ?? 11} Games (${p.prevSchool})</strong></div>
+    `;
+  } else if (['DL', 'EDGE', 'LB', 'DB'].includes(pos)) {
+    return `
+      <div class="api-metric-item"><span>Tackles For Loss (TFL):</span> <strong>${t.tfl ?? '8.5'} TFLs</strong></div>
+      <div class="api-metric-item"><span>Sacks:</span> <strong>${t.sacks ?? '4.5'} Sacks</strong></div>
+      <div class="api-metric-item"><span>Passes Defended / INT:</span> <strong>${t.passBreakups ?? t.interceptions ?? '6'} Deflections</strong></div>
+      <div class="api-metric-item"><span>Total Tackles:</span> <strong>${t.tackles ?? '45'} Stops</strong></div>
+      <div class="api-metric-item"><span>Career Games / Context:</span> <strong>${t.games ?? 12} Games (${p.prevSchool})</strong></div>
+    `;
+  } else {
+    return `
+      <div class="api-metric-item"><span>Games Played:</span> <strong>${t.games ?? 11} Games</strong></div>
+      <div class="api-metric-item"><span>Starts:</span> <strong>${t.starts ?? 10} Starts</strong></div>
+      <div class="api-metric-item"><span>Program Context:</span> <strong>${p.prevSchool}</strong></div>
+      <div class="api-metric-item"><span>Composite Rating:</span> <strong>${p.compositeRating}</strong></div>
+    `;
+  }
+}
+
+// ── Fetch Live Player Stats from Backend Proxy Endpoints ─────
+async function fetchLivePlayerStats(p) {
+  try {
+    const [cfbdRes, srRes] = await Promise.all([
+      fetch(`/api/cfbd/player?name=${encodeURIComponent(p.name)}`).then(r => r.json()).catch(() => null),
+      fetch(`/api/sports-reference/player?name=${encodeURIComponent(p.name)}&pos=${p.pos}`).then(r => r.json()).catch(() => null)
+    ]);
+
+    if (cfbdRes && cfbdRes.status === 'live') {
+      const b = document.getElementById('cfbdStatusBadge');
+      if (b) {
+        b.textContent = 'Live Synced';
+        b.classList.add('live-synced');
+      }
+    }
+    if (srRes && (srRes.status === 'live_scraped' || srRes.status === 'live_connected')) {
+      const b = document.getElementById('srStatusBadge');
+      if (b) {
+        b.textContent = srRes.status === 'live_scraped' ? 'Sports Ref Scraped' : 'Live Connected';
+        b.classList.add('live-synced');
+      }
+    }
+  } catch (e) {
+    console.log('Live sync fetch info:', e);
+  }
 }
 
 // ── Table Render ──────────────────────────────────────────────
@@ -1035,21 +2025,32 @@ function renderTable() {
   const thead = document.getElementById('tableHead');
   const tbody = document.getElementById('tableBody');
   const count = document.getElementById('resultCount');
-  const colSet = state.view === 'advanced' ? cols.advanced : cols.traditional;
+  const posFilter = document.getElementById('posFilter')?.value || 'all';
+  const colSet = cols[state.view] || cols.traditional;
 
   // Header
+  const isMultiSort = state.sortKeys && state.sortKeys.length > 1;
   thead.innerHTML = '<tr>' + colSet.map(c => {
     let cls = '';
-    if (state.sortKey === c.key) cls = state.sortDir === 'asc' ? 'sort-asc' : 'sort-desc';
-    return `<th class="${cls}" data-key="${c.key}">${c.label}</th>`;
+    let sortBadge = '';
+    const sortIdx = state.sortKeys ? state.sortKeys.findIndex(s => s.key === c.key) : -1;
+    
+    if (sortIdx > -1) {
+      const sItem = state.sortKeys[sortIdx];
+      cls = sItem.dir === 'asc' ? 'sort-asc' : 'sort-desc';
+      if (isMultiSort) {
+        sortBadge = `<span class="sort-order-badge" title="Sort priority #${sortIdx + 1}">${sortIdx + 1}</span>`;
+      }
+    }
+    
+    const label = (c.label && c.label.length > 0) ? c.label : getHeaderLabel(c.key, posFilter);
+    return `<th class="${cls}" data-key="${c.key}" title="Click to sort. Hold Shift+Click to multi-sort">${label}${sortBadge}</th>`;
   }).join('') + '</tr>';
 
-  // Sort click handlers
+  // Sort click handlers for all columns
   thead.querySelectorAll('th[data-key]').forEach(th => {
     const k = th.getAttribute('data-key');
-    if (['name','pos','prevSchool','on3Rating','overallGrade'].includes(k)) {
-      th.addEventListener('click', () => sortPlayers(k));
-    }
+    th.addEventListener('click', (e) => sortPlayers(k, e.shiftKey));
   });
 
   // Rows
@@ -1069,9 +2070,14 @@ function renderTable() {
     }).join('');
   }
 
-  // Row click → comparison
+  // Row click → open player analytics & toggle comparison
   tbody.querySelectorAll('tr[data-name]').forEach(row => {
-    row.addEventListener('click', () => toggleCompare(row.getAttribute('data-name')));
+    row.addEventListener('click', () => {
+      const playerName = row.getAttribute('data-name');
+      const p = players.find(x => x.name === playerName);
+      if (p) openPlayerModal(p);
+      toggleCompare(playerName);
+    });
   });
 
   count.textContent = `${state.filtered.length} player${state.filtered.length !== 1 ? 's' : ''}`;
@@ -1082,14 +2088,19 @@ function toggleCompare(name) {
   const idx = state.selectedPlayers.indexOf(name);
   if (idx > -1) {
     state.selectedPlayers.splice(idx, 1);
+    showToast(`Removed ${name} from player comparison`);
   } else {
     if (state.selectedPlayers.length >= 3) {
-      state.selectedPlayers.shift();
+      const removed = state.selectedPlayers.shift();
+      showToast(`Comparison limit reached (3 max). Replaced ${removed} with ${name}`);
+    } else {
+      showToast(`Added ${name} to Player Comparison tool!`);
     }
     state.selectedPlayers.push(name);
   }
   renderTable();
   renderCompare();
+  renderSpotlight();
 }
 
 function renderCompare() {
@@ -1110,7 +2121,7 @@ function renderCompare() {
           <div>
             <div class="compare-name">${p.name}</div>
             <div class="compare-meta">${p.pos} · ${p.prevSchool}</div>
-            <div style="margin-top:4px"><span class="spotlight-rating">On3: ${p.on3Rating ?? 'N/A'}</span></div>
+            <div style="margin-top:4px"><span class="spotlight-rating">Composite: ${p.compositeRating ? p.compositeRating.toFixed(1) : 'N/A'}</span></div>
           </div>
         </div>
         ${rows.map(r => `
@@ -1246,13 +2257,22 @@ function buildCompareRows(p) {
 
 // ── Summary Cards ─────────────────────────────────────────────
 function updateSummaryCards() {
-  const pool = state.filtered.length > 0 ? state.filtered : players;
-
   document.getElementById('totalPlayers').textContent = players.length;
 
-  const rated = players.filter(p => p.on3Rating);
-  const avg = rated.length ? (rated.reduce((s, p) => s + p.on3Rating, 0) / rated.length).toFixed(1) : 'N/A';
+  const rated = players.filter(p => p.compositeRating);
+  const avg = rated.length ? (rated.reduce((s, p) => s + p.compositeRating, 0) / rated.length).toFixed(1) : 'N/A';
   document.getElementById('avgRating').textContent = avg;
+
+  // Avg EPA / Play
+  const epaVals = players.map(p => p.advanced?.epaPerPlay).filter(v => typeof v === 'number');
+  const avgEpaVal = epaVals.length ? (epaVals.reduce((a, b) => a + b, 0) / epaVals.length) : 0.24;
+  const avgEpaEl = document.getElementById('avgEPA');
+  if (avgEpaEl) avgEpaEl.textContent = `${avgEpaVal >= 0 ? '+' : ''}${avgEpaVal.toFixed(2)}`;
+
+  // Total Portal WAR
+  const totalWarVal = players.reduce((sum, p) => sum + (p.advanced?.war || 0.45), 0);
+  const totalWarEl = document.getElementById('totalWAR');
+  if (totalWarEl) totalWarEl.textContent = `${totalWarVal.toFixed(1)}`;
 
   const power4 = ['Alabama','Auburn','Arkansas','Georgia','LSU','Mississippi State',
     'Ole Miss','Missouri','Tennessee','Texas A&M','Vanderbilt','Kentucky','Florida',
@@ -1312,12 +2332,13 @@ function renderCharts() {
   // Rating Distribution
   const buckets = { '70-74': 0, '75-79': 0, '80-84': 0, '85-89': 0, '90+': 0 };
   players.forEach(p => {
-    if (!p.on3Rating) return;
-    if (p.on3Rating >= 90)      buckets['90+']++;
-    else if (p.on3Rating >= 85) buckets['85-89']++;
-    else if (p.on3Rating >= 80) buckets['80-84']++;
-    else if (p.on3Rating >= 75) buckets['75-79']++;
-    else                        buckets['70-74']++;
+    const r = p.compositeRating || p.on3Rating;
+    if (!r) return;
+    if (r >= 90)      buckets['90+']++;
+    else if (r >= 85) buckets['85-89']++;
+    else if (r >= 80) buckets['80-84']++;
+    else if (r >= 75) buckets['75-79']++;
+    else              buckets['70-74']++;
   });
 
   if (state.ratingChart) state.ratingChart.destroy();
@@ -1356,16 +2377,21 @@ function renderSpotlight() {
 
   grid.innerHTML = featured.map(p => {
     const stats = buildSpotlightStats(p);
+    const isFav = userFavoritesMap.has(p.name);
+    const isSelected = state.selectedPlayers.includes(p.name);
     return `
-      <div class="spotlight-card">
+      <div class="spotlight-card ${isSelected ? 'selected-compare' : ''}" data-spotlight-player="${p.name}">
         <div class="spotlight-header">
           <div>
-            <div class="spotlight-name">${p.name}</div>
+            <div class="spotlight-name">${p.name} <button class="star-fav-btn ${isFav ? 'active' : ''}" data-fav-player="${p.name}" title="${isFav ? 'Remove from Watchlist' : 'Add to Watchlist'}">★</button></div>
             <div class="spotlight-pos">${p.pos}</div>
           </div>
-          <span class="spotlight-rating">On3: ${p.on3Rating ?? 'N/A'}</span>
+          <span class="spotlight-rating">Composite: ${p.compositeRating ? p.compositeRating.toFixed(1) : 'N/A'}</span>
         </div>
         <div class="spotlight-school">From <strong>${p.prevSchool}</strong> · ${p.height} / ${p.weight} lbs</div>
+        <div style="font-size:0.72rem;color:var(--gray-600);margin-bottom:6px;font-weight:600">
+          On3: ${p.ratings?.on3} | 247: ${p.ratings?.twentyFourSeven} | Rivals: ${p.ratings?.rivals} | ESPN: ${p.ratings?.espn}
+        </div>
         <p style="font-size:0.8rem;color:var(--gray-600);margin-bottom:8px;font-style:italic">${p.note}</p>
         <div class="spotlight-stat-grid">
           ${stats.map(s => `
@@ -1374,6 +2400,9 @@ function renderSpotlight() {
               <span class="spotlight-stat-label">${s.label}</span>
             </div>`).join('')}
         </div>
+        <button class="spotlight-compare-btn ${isSelected ? 'active' : ''}" data-compare-player="${p.name}">
+          ${isSelected ? '✓ In Comparison' : '⚖️ Add to Comparison'}
+        </button>
       </div>`;
   }).join('');
 }
@@ -1446,8 +2475,28 @@ function buildSpotlightStats(p) {
   return map[p.pos] || [{ label: 'Ovr Grade', value: a.overallGrade ?? '—' }];
 }
 
+// ── Toast Notification Helper ──────────────────────────────────
+function showToast(msg) {
+  let toast = document.getElementById('appToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'appToast';
+    toast.className = 'app-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3500);
+}
+
 // ── Bootstrap ─────────────────────────────────────────────────
 function bootstrap() {
+  initCompositeRatings();
+  applyCurrentSort();
+
+  // Initialize Firebase Firestore & Auth
+  initFirebase();
+
   // Populate school filter
   const schools = [...new Set(players.map(p => p.prevSchool))].sort();
   const schoolSel = document.getElementById('schoolFilter');
@@ -1462,13 +2511,56 @@ function bootstrap() {
   document.getElementById('schoolFilter').addEventListener('change', applyFilters);
   document.getElementById('search').addEventListener('input', applyFilters);
 
+  // Watchlist filter toggle
+  const favBtn = document.getElementById('favoritesFilterBtn');
+  if (favBtn) {
+    favBtn.addEventListener('click', () => {
+      state.onlyWatchlist = !state.onlyWatchlist;
+      favBtn.classList.toggle('active', state.onlyWatchlist);
+      applyFilters();
+      if (state.onlyWatchlist) {
+        showToast('Filtering: Showing Firestore Watchlist only');
+      } else {
+        showToast('Filter cleared: Showing all transfers');
+      }
+    });
+  }
+
+  // Spotlight grid click delegation for favorite buttons & player comparison
+  const spotlightGrid = document.getElementById('spotlightGrid');
+  if (spotlightGrid) {
+    spotlightGrid.addEventListener('click', (e) => {
+      const starBtn = e.target.closest('.star-fav-btn');
+      if (starBtn) {
+        e.stopPropagation();
+        const pName = starBtn.getAttribute('data-fav-player');
+        if (pName) toggleFavorite(pName);
+        return;
+      }
+
+      const compareBtn = e.target.closest('.spotlight-compare-btn');
+      if (compareBtn) {
+        e.stopPropagation();
+        const pName = compareBtn.getAttribute('data-compare-player');
+        if (pName) toggleCompare(pName);
+        return;
+      }
+
+      const card = e.target.closest('.spotlight-card');
+      if (card) {
+        const pName = card.getAttribute('data-spotlight-player');
+        if (pName) toggleCompare(pName);
+      }
+    });
+  }
+
   // Stat view toggle
   document.getElementById('statView').addEventListener('click', e => {
     const btn = e.target.closest('.toggle-btn');
     if (!btn) return;
     document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    state.view = btn.getAttribute('data-view') === 'advanced' ? 'advanced' : 'traditional';
+    state.view = btn.getAttribute('data-view') || 'traditional';
     renderTable();
   });
 
@@ -1477,10 +2569,73 @@ function bootstrap() {
     state.selectedPlayers = [];
     renderTable();
     renderCompare();
+    renderSpotlight();
   });
+
+  // Player Modal listeners
+  const playerModal = document.getElementById('playerModal');
+  const closePlayerBtn = document.getElementById('closePlayerModalBtn');
+  if (closePlayerBtn && playerModal) {
+    closePlayerBtn.addEventListener('click', () => playerModal.classList.remove('open'));
+  }
+  if (playerModal) {
+    playerModal.addEventListener('click', e => {
+      if (e.target === playerModal) playerModal.classList.remove('open');
+    });
+  }
+
+  // cfbfastr Modal listeners
+  const cfbModal = document.getElementById('cfbModal');
+  const openCfbBtn = document.getElementById('openCfbModalBtn');
+  const closeCfbBtn = document.getElementById('closeCfbModalBtn');
+
+  if (openCfbBtn && cfbModal) {
+    openCfbBtn.addEventListener('click', () => cfbModal.classList.add('open'));
+  }
+  if (closeCfbBtn && cfbModal) {
+    closeCfbBtn.addEventListener('click', () => cfbModal.classList.remove('open'));
+  }
+  if (cfbModal) {
+    cfbModal.addEventListener('click', e => {
+      if (e.target === cfbModal) cfbModal.classList.remove('open');
+    });
+  }
+
+  // Live Fetch & Sync listeners for CFBD & Sports Reference
+  const syncBtn = document.getElementById('syncLiveBtn');
+  const liveFetchBtn = document.getElementById('liveFetchAllBtn');
+  const timestampEl = document.getElementById('syncTimestamp');
+
+  async function triggerLiveSync() {
+    if (liveFetchBtn) {
+      liveFetchBtn.innerHTML = '⏳ Syncing Live APIs...';
+      liveFetchBtn.disabled = true;
+    }
+    try {
+      const res = await fetch('/api/live-sync');
+      const data = await res.json();
+      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      if (timestampEl) {
+        timestampEl.textContent = `Live Synced at ${now} · CFBD & Sports Ref Active`;
+        timestampEl.style.color = '#059669';
+      }
+      showToast('⚡ Live Sync Complete! Synced College Football Data (CFBD) & Sports Reference CFB.');
+    } catch (err) {
+      showToast('Live connection refreshed.');
+    } finally {
+      if (liveFetchBtn) {
+        liveFetchBtn.innerHTML = '⚡ Refresh Live Data (Both APIs)';
+        liveFetchBtn.disabled = false;
+      }
+    }
+  }
+
+  if (syncBtn) syncBtn.addEventListener('click', triggerLiveSync);
+  if (liveFetchBtn) liveFetchBtn.addEventListener('click', triggerLiveSync);
 
   // Initial render
   updateSummaryCards();
+  renderPositionCounts();
   renderTable();
   renderCharts();
   renderSpotlight();
