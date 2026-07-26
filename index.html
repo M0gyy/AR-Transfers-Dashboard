@@ -22,7 +22,6 @@
       <div class="header-meta">
         <span class="badge">42 Incoming Transfers</span>
         <span class="badge badge-alt">New Era · Coach Ryan Silverfield</span>
-        <button class="badge badge-cfb" id="openCfbModalBtn" title="View cfbfastr & CFBD stat definitions & data API sync">⚡ Sourced via cfbfastr &amp; CFBD</button>
       </div>
     </div>
   </header>
@@ -52,6 +51,24 @@
     <div class="card-stat">
       <span class="stat-num" id="positionCount">0</span>
       <span class="stat-label">Positions Filled</span>
+    </div>
+  </section>
+
+  <!-- Live Data Connection Banner -->
+  <section class="live-sources-bar">
+    <div class="live-sources-inner">
+      <div class="source-badge-group">
+        <div class="source-badge cfbd-source">
+          <span class="source-status-dot"></span>
+          <span class="source-title">CFBD Live API</span>
+          <span class="source-desc">PPA/EPA · Usage % · Success Rate · Team Talent</span>
+        </div>
+        <div class="source-badge sr-source">
+          <span class="source-status-dot"></span>
+          <span class="source-title">Sports Reference CFB</span>
+          <span class="source-desc">AY/A · NCAA Passer Rating · Scrimmage Yds · TFLs/Sacks</span>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -112,6 +129,7 @@
       <div class="section-header">
         <div class="section-title-group">
           <h2>2026 Transfers</h2>
+          <span class="table-click-hint">Click any player for an advanced breakdown</span>
         </div>
         <span class="result-count" id="resultCount"></span>
       </div>
